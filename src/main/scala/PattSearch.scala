@@ -24,6 +24,24 @@ object PattSearch extends App {
     .appName("PattSearch")
     .config("spark.cassandra.connection.host","10.241.5.234")
     .config("spark.submit.deployMode","client")//"cluster"
+    .config("spark.shuffle.service.enabled", "true")
+    .config("spark.dynamicAllocation.enabled", "true")
+    .config("spark.driver.allowMultipleContexts","true")
+    .config("spark.cassandra.input.split.size_in_mb","128")
+    .config("spark.cassandra.input.fetch.size_in_rows","10000")
+    .config("spark.driver.cores","2")
+    .config("spark.cores.max","4")
+    .config("spark.driver.memory","2g")
+    .config("spark.executor.memory", "3g")
+    .config("spark.executor.cores","2")
+    .getOrCreate()
+
+  /*
+    val spark = SparkSession.builder()
+    .master("local[*]")//"spark://10.241.5.234:7077"
+    .appName("PattSearch")
+    .config("spark.cassandra.connection.host","10.241.5.234")
+    .config("spark.submit.deployMode","client")//"cluster"
     .config("spark.shuffle.service.enabled", "false")
     .config("spark.dynamicAllocation.enabled", "false")
     .config("spark.driver.allowMultipleContexts","true")
@@ -35,6 +53,7 @@ object PattSearch extends App {
     .config("spark.executor.memory", "1g")
     .config("spark.executor.cores","1")
     .getOrCreate()
+  */
 
   /*
     .master("spark://10.241.5.234:7077")
@@ -150,16 +169,17 @@ object PattSearch extends App {
 
 
 
-  class ComparePatter() extends UserDefinedAggregateFunction {
 
-    //val tPatternDf = spark.sql(" SELECT d.* FROM t_barsPattern d ")
+
+  class ComparePatter() extends UserDefinedAggregateFunction {
 
     // Input Data Type Schema of Rows.
     def inputSchema: StructType = StructType(Array(
-      StructField("ts_begin", IntegerType),
-      StructField("btype",    StringType),
-      StructField("disp",     DoubleType),
-      StructField("log_co",   DoubleType)
+      StructField("ts_begin",        IntegerType),
+      StructField("btype",           StringType),
+      StructField("disp",            DoubleType),
+      StructField("log_co",          DoubleType),
+      StructField("comp_pattern_rn", ArrayType(IntegerType))
     )
     )
 
@@ -199,8 +219,9 @@ object PattSearch extends App {
     def evaluate(buffer: Row) = {
       /*~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~*/
       // Is it visible spark.sql temp table here
-      val tPatternDf = spark.sql(" SELECT d.* FROM t_barsPattern d ")
-      otocLogg.log.info("!!! - [evaluate] tPatternDf.count() = ["+ tPatternDf.count() +"]")
+      //Too slow!!!
+      //val tPatternDf = spark.sql(" SELECT d.* FROM t_barsPattern d ")
+      //otocLogg.log.info("!!! - [evaluate] tPatternDf.count() = ["+ tPatternDf.count() +"]")
       /*~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~*/
       buffer.getDouble(0)/buffer.getLong(1).toDouble
     }
@@ -226,6 +247,8 @@ object PattSearch extends App {
             thisRow.getAs("log_co").toString)
   }
   /*~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~*/
+
+
   val nBuckets = 3
 
   val windowSpec = Window
@@ -233,34 +256,62 @@ object PattSearch extends App {
     .rowsBetween(Window.currentRow, nBuckets-1)
 
   //get 3 first (order by ts_begin asc) rows as pattern for search
-  val barsPattern = listBars.orderBy($"ts_begin".asc).limit(3).withColumn("rn", row_number() over Window.orderBy(col("ts_begin").asc))
+  val barsPattern = listBars
+    .orderBy($"ts_begin".asc)
+    .limit(3)
+    .withColumn("rn", row_number() over Window.orderBy(col("ts_begin").asc))
+
   otocLogg.log.info("barsPattern last")
   barsPattern.show()
 
   otocLogg.log.info("listBars last") // rn = 1,2,3
 
   listBars.createOrReplaceTempView("t_listBars")
+
+  barsPattern.persist()
+  broadcast(barsPattern)
   barsPattern.createOrReplaceTempView("t_barsPattern")
 
   val compPatt = new ComparePatter()
-
   spark.udf.register("compPatt", compPatt)
 
+  /*
+                                             SELECT ds.*
+                                                ,array(
+                                                        (CASE WHEN d1.rn IS NOT NULL THEN d1.rn ELSE 0 END),
+                                                        (CASE WHEN d2.rn IS NOT NULL THEN d2.rn ELSE 0 END),
+                                                        (CASE WHEN d3.rn IS NOT NULL THEN d3.rn ELSE 0 END)
+                                                      )  as comp_pattern_rn
+  */
 
-//ds.ts_begin, ds.btype, ds.disp, ds.log_co
-  val join1_Res = spark.sql(" SELECT ds.* , compPatt(ds.*) " +
-                                      "              OVER(ORDER BY ds.TS_BEGIN asc ROWS BETWEEN CURRENT ROW and 2 FOLLOWING) as compPatt" +
-                                      "      ,(CASE WHEN d1.rn IS NOT NULL THEN 1 ELSE 0 END) as J1 " +
-                                      "      ,(CASE WHEN d2.rn IS NOT NULL THEN 1 ELSE 0 END) as J2 " +
-                                      "      ,(CASE WHEN d3.rn IS NOT NULL THEN 1 ELSE 0 END) as J3 " +
-                                      " FROM      t_listBars ds " +
-                                      " LEFT JOIN t_barsPattern d1 ON ds.btype = d1.btype and  d1.disp BETWEEN ds.disp*0.8 and ds.disp*1.2 and d1.rn=1  " +
-                                      " LEFT JOIN t_barsPattern d2 ON ds.btype = d2.btype and  d2.disp BETWEEN ds.disp*0.8 and ds.disp*1.2 and d2.rn=2  " +
-                                      " LEFT JOIN t_barsPattern d3 ON ds.btype = d3.btype and  d3.disp BETWEEN ds.disp*0.8 and ds.disp*1.2 and d3.rn=3  " +
-    "")
+ //COALESCE(d1.rn,0)
+  val joinedHistPattern = spark.sql(""" SELECT
+                                                       ds.*
+                                                          ,array(
+                                                                 COALESCE(d1.rn,0),
+                                                                 COALESCE(d2.rn,0),
+                                                                 COALESCE(d3.rn,0)
+                                                                ) as comp_pattern_rn,
+                                                       compPatt(
+                                                           ds.*
+                                                           ,array(
+                                                                  COALESCE(d1.rn,0),
+                                                                  COALESCE(d2.rn,0),
+                                                                  COALESCE(d3.rn,0)
+                                                                 )
+                                                       )
+                                                       OVER (ORDER BY ds.ts_begin asc ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING) as res_eq_pattern
+                                       FROM  t_listBars ds
+                                        LEFT JOIN t_barsPattern d1 ON ds.btype = d1.btype and d1.disp BETWEEN ds.disp*0.8 and ds.disp*1.2 and d1.rn=1
+                                        LEFT JOIN t_barsPattern d2 ON ds.btype = d2.btype and d2.disp BETWEEN ds.disp*0.8 and ds.disp*1.2 and d2.rn=2
+                                        LEFT JOIN t_barsPattern d3 ON ds.btype = d3.btype and d3.disp BETWEEN ds.disp*0.8 and ds.disp*1.2 and d3.rn=3
+                                    """)
+
+  joinedHistPattern.printSchema()
+
+  joinedHistPattern.show(50)
 
 
-  join1_Res.show(50)
 
   /*
   listBars.join(barsPattern.filter($"rn" === 1),
