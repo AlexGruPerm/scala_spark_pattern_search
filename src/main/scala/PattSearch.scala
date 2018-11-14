@@ -1,9 +1,10 @@
 
 //import org.apache.spark.sql.types.{IntegerType, StructField, StructType}
 import org.apache.spark.sql.expressions.{MutableAggregationBuffer, UserDefinedAggregateFunction}
-import org.apache.spark.sql.types._
 import org.apache.spark.sql.{DataFrame, Row, SparkSession}
 import org.slf4j.LoggerFactory
+
+import scala.collection.mutable
 
 /*
 import org.apache.spark.sql.cassandra._
@@ -169,50 +170,60 @@ object PattSearch extends App {
 
 
 
-
+  import org.apache.spark.sql.types._
 
   class ComparePatter() extends UserDefinedAggregateFunction {
 
     // Input Data Type Schema of Rows.
     def inputSchema: StructType = StructType(Array(
-      StructField("ts_begin",        IntegerType),
-      StructField("btype",           StringType),
-      StructField("disp",            DoubleType),
-      StructField("log_co",          DoubleType),
       StructField("comp_pattern_rn", ArrayType(IntegerType))
     )
     )
 
     // Intermediate Schema
-    def bufferSchema = StructType(Array(
-      StructField("sum", DoubleType),
-      StructField("cnt", LongType)
-    ))
+    def bufferSchema: StructType = {
+      StructType(
+          StructField("row_rn_window",   IntegerType) :: //index of row : 1,2,3 colculated inside window.
+          StructField("comp_pattern_rn", ArrayType(IntegerType)) :: Nil
+      )
+    }
+
 
     // Returned Data Type .
-    def dataType: DataType = DoubleType
+    def dataType: DataType = IntegerType //        ArrayType(IntegerType)        //IntegerType
+
 
     // Self-explaining
     def deterministic = true
 
     // This function is called whenever key changes
     def initialize(buffer: MutableAggregationBuffer) = {
-      buffer(0) = 0.toDouble // set sum to zero
-      buffer(1) = 0L // set number of items to 0
+/*
+      buffer(0) = 0.toDouble
+      buffer(1) = 0L
+*/      buffer(0) = 0 //row_rn_window, 1 for first row.
+        buffer(1) = Nil
     }
 
     // Iterate over each entry of a group
     def update(buffer: MutableAggregationBuffer, input: Row) = {
       // With [0] - java.lang.ClassCastException: java.lang.Integer cannot be cast to java.lang.Double
-      // Because 0 it's a ts_begin (Int)
+
+      buffer(0) = buffer.getInt(0)+1
+      buffer(1) = input.getAs[mutable.WrappedArray[Int]](0) //One field array []
+
+      /*
+      //backup
       buffer(0) = buffer.getDouble(0) + input.getDouble(2)
       buffer(1) = buffer.getLong(1) + 1
+      */
+
     }
 
     // Merge two partial aggregates
     def merge(buffer1: MutableAggregationBuffer, buffer2: Row) = {
-      buffer1(0) = buffer1.getDouble(0) + buffer2.getDouble(2) // get field disp
-      buffer1(1) = buffer1.getLong(1) + 1//buffer2.getLong(1)
+      //buffer1(0) = buffer1.getDouble(0) + buffer2.getDouble(2) // get field disp
+      //buffer1(1) = buffer1.getLong(1) + 1//buffer2.getLong(1)
     }
 
     // Called after all the entries are exhausted.
@@ -223,7 +234,12 @@ object PattSearch extends App {
       //val tPatternDf = spark.sql(" SELECT d.* FROM t_barsPattern d ")
       //otocLogg.log.info("!!! - [evaluate] tPatternDf.count() = ["+ tPatternDf.count() +"]")
       /*~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~*/
-      buffer.getDouble(0)/buffer.getLong(1).toDouble
+      //buffer.getDouble(0)/buffer.getLong(1).toDouble
+      //1
+      //buffer.getAs[ArrayType](4)
+
+      buffer.getInt(0)
+      //buffer.getAs[mutable.WrappedArray[Int]](1)
     }
 
   }
@@ -284,7 +300,17 @@ object PattSearch extends App {
                                                       )  as comp_pattern_rn
   */
 
- //COALESCE(d1.rn,0)
+  /*
+                                                       compPatt(
+                                                           ds.*
+                                                           ,array(
+                                                                  COALESCE(d1.rn,0),
+                                                                  COALESCE(d2.rn,0),
+                                                                  COALESCE(d3.rn,0)
+                                                                 )
+                                                       )
+  */
+
   val joinedHistPattern = spark.sql(""" SELECT
                                                        ds.*
                                                           ,array(
@@ -293,8 +319,7 @@ object PattSearch extends App {
                                                                  COALESCE(d3.rn,0)
                                                                 ) as comp_pattern_rn,
                                                        compPatt(
-                                                           ds.*
-                                                           ,array(
+                                                            array(
                                                                   COALESCE(d1.rn,0),
                                                                   COALESCE(d2.rn,0),
                                                                   COALESCE(d3.rn,0)
