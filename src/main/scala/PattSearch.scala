@@ -183,8 +183,9 @@ object PattSearch extends App {
     // Intermediate Schema
     def bufferSchema: StructType = {
       StructType(
-          StructField("row_rn_window",   IntegerType) :: //index of row : 1,2,3 colculated inside window.
-          StructField("comp_pattern_rn", ArrayType(IntegerType)) :: Nil
+            StructField("row_rn_window", IntegerType) :: //index of row : 1,2,3 colculated inside window.
+            StructField("inp_array",     ArrayType(IntegerType)) ::
+            StructField("cnt_eq",        IntegerType) :: Nil
       )
     }
 
@@ -198,32 +199,32 @@ object PattSearch extends App {
 
     // This function is called whenever key changes
     def initialize(buffer: MutableAggregationBuffer) = {
-/*
-      buffer(0) = 0.toDouble
-      buffer(1) = 0L
-*/      buffer(0) = 0 //row_rn_window, 1 for first row.
-        buffer(1) = Nil
+        buffer(0) = 0    // row_rn_window, 1 for first row.
+        buffer(1) = Nil  // inp_array
+        buffer(2) = 0    // cnt_eq
     }
 
     // Iterate over each entry of a group
     def update(buffer: MutableAggregationBuffer, input: Row) = {
-      // With [0] - java.lang.ClassCastException: java.lang.Integer cannot be cast to java.lang.Double
 
-      buffer(0) = buffer.getInt(0)+1
       buffer(1) = input.getAs[mutable.WrappedArray[Int]](0) //One field array []
 
-      /*
-      //backup
-      buffer(0) = buffer.getDouble(0) + input.getDouble(2)
-      buffer(1) = buffer.getLong(1) + 1
-      */
+      val wpA = buffer.getAs[mutable.WrappedArray[Int]](1)
+
+      //otocLogg.log.info("======== >>>>>>>>>  " + buffer(1) + "   for take by index  INDEX == buffer(0)=" + buffer(0) + "  buffer(1)(0)= " +wpA(0) + "  buffer(1)(1)= "+wpA(1)+ "  buffer(1)(2)= "+wpA(2))
+
+      val idx :Int = buffer.getInt(0)
+
+      if (wpA(buffer.getInt(0)) == (buffer.getInt(0)+1))
+        buffer(2) = buffer.getInt(2) + 1
+
+
+      buffer(0) = buffer.getInt(0)+1
 
     }
 
     // Merge two partial aggregates
     def merge(buffer1: MutableAggregationBuffer, buffer2: Row) = {
-      //buffer1(0) = buffer1.getDouble(0) + buffer2.getDouble(2) // get field disp
-      //buffer1(1) = buffer1.getLong(1) + 1//buffer2.getLong(1)
     }
 
     // Called after all the entries are exhausted.
@@ -237,8 +238,12 @@ object PattSearch extends App {
       //buffer.getDouble(0)/buffer.getLong(1).toDouble
       //1
       //buffer.getAs[ArrayType](4)
-
-      buffer.getInt(0)
+      //otocLogg.log.info("======== >>>>>>>>>  size input array [" + buffer.getAs[mutable.WrappedArray[Int]](1).size+" ]")
+      //otocLogg.log.info("======== >>> FOR TEST cnt_eq [" + buffer.getInt(2) + " ]")
+      //buffer.getInt(0)
+      if (buffer.getAs[mutable.WrappedArray[Int]](1).size==buffer.getInt(2))
+        1
+      else 0
       //buffer.getAs[mutable.WrappedArray[Int]](1)
     }
 
@@ -247,6 +252,7 @@ object PattSearch extends App {
 
 
   val t1_common = System.currentTimeMillis
+
   val listBars = getBarsFromCass(1,300)
 
   /*~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~*/
@@ -271,16 +277,18 @@ object PattSearch extends App {
     .orderBy(col("ts_begin").asc)
     .rowsBetween(Window.currentRow, nBuckets-1)
 
+
   //get 3 first (order by ts_begin asc) rows as pattern for search
   val barsPattern = listBars
     .orderBy($"ts_begin".asc)
-    .limit(3)
+    .limit(nBuckets)
     .withColumn("rn", row_number() over Window.orderBy(col("ts_begin").asc))
+
 
   otocLogg.log.info("barsPattern last")
   barsPattern.show()
 
-  otocLogg.log.info("listBars last") // rn = 1,2,3
+  otocLogg.log.info("listBars last")
 
   listBars.createOrReplaceTempView("t_listBars")
 
@@ -290,26 +298,6 @@ object PattSearch extends App {
 
   val compPatt = new ComparePatter()
   spark.udf.register("compPatt", compPatt)
-
-  /*
-                                             SELECT ds.*
-                                                ,array(
-                                                        (CASE WHEN d1.rn IS NOT NULL THEN d1.rn ELSE 0 END),
-                                                        (CASE WHEN d2.rn IS NOT NULL THEN d2.rn ELSE 0 END),
-                                                        (CASE WHEN d3.rn IS NOT NULL THEN d3.rn ELSE 0 END)
-                                                      )  as comp_pattern_rn
-  */
-
-  /*
-                                                       compPatt(
-                                                           ds.*
-                                                           ,array(
-                                                                  COALESCE(d1.rn,0),
-                                                                  COALESCE(d2.rn,0),
-                                                                  COALESCE(d3.rn,0)
-                                                                 )
-                                                       )
-  */
 
   val joinedHistPattern = spark.sql(""" SELECT
                                                        ds.*
@@ -324,72 +312,21 @@ object PattSearch extends App {
                                                                   COALESCE(d2.rn,0),
                                                                   COALESCE(d3.rn,0)
                                                                  )
-                                                       )
-                                                       OVER (ORDER BY ds.ts_begin asc ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING) as res_eq_pattern
+                                                       )                       OVER (ORDER BY ds.ts_begin asc ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING) as res_eq_pattern,
+                                                       LAST_VALUE(ds.ts_begin) OVER (ORDER BY ds.ts_begin asc ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING) as search_form_last_bar
                                        FROM  t_listBars ds
-                                        LEFT JOIN t_barsPattern d1 ON ds.btype = d1.btype and d1.disp BETWEEN ds.disp*0.8 and ds.disp*1.2 and d1.rn=1
-                                        LEFT JOIN t_barsPattern d2 ON ds.btype = d2.btype and d2.disp BETWEEN ds.disp*0.8 and ds.disp*1.2 and d2.rn=2
-                                        LEFT JOIN t_barsPattern d3 ON ds.btype = d3.btype and d3.disp BETWEEN ds.disp*0.8 and ds.disp*1.2 and d3.rn=3
+                                        LEFT JOIN t_barsPattern d1 ON ds.btype = d1.btype and d1.disp BETWEEN ds.disp*0.7 and ds.disp*1.3 and d1.rn=1
+                                        LEFT JOIN t_barsPattern d2 ON ds.btype = d2.btype and d2.disp BETWEEN ds.disp*0.7 and ds.disp*1.3 and d2.rn=2
+                                        LEFT JOIN t_barsPattern d3 ON ds.btype = d3.btype and d3.disp BETWEEN ds.disp*0.7 and ds.disp*1.3 and d3.rn=3
                                     """)
 
-  joinedHistPattern.printSchema()
-
-  joinedHistPattern.show(50)
+  //joinedHistPattern.printSchema()
 
 
-
-  /*
-  listBars.join(barsPattern.filter($"rn" === 1),
-    listBars("btype") === barsPattern("btype") && (listBars("disp") >= barsPattern("disp")*0.8 && listBars("disp") <= barsPattern("disp")*1.2 )
-    ,"left"
-  ).select(listBars.columns.map(c => listBars(c)): _*
-    .show
-*/
-  //df.na.replace(df.columns,Map("" -> "0")).show()
-  //d1.as("d1").join(d2.as("d2"), $"d1.id" === $"d2.id").select($"d1.*")
+  joinedHistPattern.show(20)
 
 
-/*
-  val nBuckets = 3
-
-  val lb = listBars
-    .withColumn("rn", row_number() over Window.orderBy(col("ts_begin").asc) )
-    .withColumn("rn", floor(($"rn"-1)/nBuckets))
-    .withColumn("rnk", row_number() over Window.partitionBy("rn").orderBy(col("ts_begin").asc) )
-    //-------------------------
-    .groupBy("rn")
-    .pivot("rnk", 1 to nBuckets)
-    .agg(
-      sum("ts_begin").alias("ts_begin"),
-      sum("btype").alias("btype"),
-      sum("disp").alias("disp"),
-      sum("log_co").alias("log_co")
-    )
-    //-------------------------
-lb.show()
-*/
-
-  /*
-    //For example this is a first row.
-    val barsPattern = lb.filter($"rn" === 0).select("1_ts_begin", "1_btype", "1_disp", "1_log_co")
-    //barsPattern.printSchema()
-    val newNames = Seq("0_ts_begin", "0_btype", "0_disp", "0_log_co")
-    val bpRowDf = barsPattern.toDF(newNames: _*)
-   /**
-     * +----------+-------+-------+--------+
-     * |0_ts_begin|0_btype| 0_disp|0_log_co|
-     * +----------+-------+-------+--------+
-     */
-    // bpRowDf.printSchema()
-    // bpRowDf.show()
-
-  otocLogg.log.info("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
-  val lbAfterCompare = lb.drop("rn").transform(ctCompareFormWithPattern(bpRowDf))
-  lbAfterCompare.show()
-  otocLogg.log.info("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
-  lbAfterCompare.filter($"compare_result" === 1).show()
-
-  */
+  //joinedHistPattern.filter($"res_eq_pattern" === 1).show(20)
 
   val t2_common = System.currentTimeMillis
   otocLogg.log.info("================== SUMMARY ========================================")
