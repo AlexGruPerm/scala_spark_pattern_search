@@ -1,15 +1,10 @@
 
 //import org.apache.spark.sql.types.{IntegerType, StructField, StructType}
 import org.apache.spark.sql.expressions.{MutableAggregationBuffer, UserDefinedAggregateFunction}
-import org.apache.spark.sql.{DataFrame, Row, SparkSession}
+import org.apache.spark.sql.{Row, SparkSession}
 import org.slf4j.LoggerFactory
 
 import scala.collection.mutable
-
-/*
-import org.apache.spark.sql.cassandra._
-import spark.implicits._
-*/
 
 
 object otocLogg extends Serializable {
@@ -81,7 +76,7 @@ object PattSearch extends App {
       .load()
       .where(col("ticker_id")     === TickerID &&
              col("bar_width_sec") === BarWidthSec)
-      .select(col("ts_begin"), col("btype"), col("disp"), col("log_co"))
+      .select(col("ts_begin"), col("c"), col("btype"), col("disp"), col("log_co"))
       .sort(asc("ts_begin"))
       .withColumn("btype",
          when(col("btype") === lit("g"), 1)
@@ -89,87 +84,10 @@ object PattSearch extends App {
         .otherwise(0))
   }
 
-  case class T_BAR(ts_begin :Long, btype :Long, disp:Double, log_co :Double){
-
-    /** All bars in one Row.
-      * Like:
-      * index:     0       1       2       3          4        5      6        7          8       9      10        11
-      * +----------+-------+-------+--------+----------+-------+-------+--------+----------+-------+-------+--------+
-      * |1_ts_begin|1_btype| 1_disp|1_log_co|2_ts_begin|2_btype| 2_disp|2_log_co|3_ts_begin|3_btype| 3_disp|3_log_co|
-      * +----------+-------+-------+--------+----------+-------+-------+--------+----------+-------+-------+--------+
-      *     barIndexStartField - first column for this bar extraction, in the example: 0,4,8
-      *     and each bar has 4 elements.
-      */
-
-    def this(r :Row, barIndexStartField :Int)=
-      this(
-        r.getLong(barIndexStartField),
-        r.getLong(barIndexStartField+1),
-        r.getDouble(barIndexStartField+2),
-        r.getDouble(barIndexStartField+3)
-      )
-
-  }
-
-  case class T_FORM(seqBars :Seq[T_BAR])
 
   import org.apache.spark.sql.expressions.Window
   import org.apache.spark.sql.functions.{col, _}
   import spark.implicits._
-
-  /*
-  import org.apache.spark.sql.expressions.Window
-  import org.apache.spark.sql.functions.{col, _}
-  import spark.implicits._
-  */
-
-  /*
-  def compareSeqWithPattern(r :Row) = {
-    val barsCount = r.size/4
-    val barsForm = T_FORM( for(i <- Range(0,11,4)) yield {
-      new T_BAR(r,i)
-    })
-    otocLogg.log.info("compareSeqWithPattern r.size="+r.size+" barsForm.size="+barsForm.seqBars.size)
-    1 // barsForm
-  }
-  */
-  //spark.udf.register("compareSeqWithPattern", compareSeqWithPattern _)
-
-  def udf_comp(p: Row) = udf(
-    (r: Row) =>
-    {
-      val barsCount = r.size / 4
-      val barsForm = T_FORM(for (i <- Range(0, 11, 4)) yield {
-        new T_BAR(r, i)
-      })
-      val barPattern = T_FORM(Seq(new T_BAR(p, 0)))
-      otocLogg.log.info("[udf_comp] r.size=" + r.size + " barsForm.size=" + barsForm.seqBars.size + " barPattern.seqBars.size=" + barPattern.seqBars.size)
-       if ((barPattern.seqBars(0).btype == barsForm.seqBars(0).btype) &&
-            (
-              (barPattern.seqBars(0).disp >= barsForm.seqBars(0).disp*0.8) &&
-              (barPattern.seqBars(0).disp <= barsForm.seqBars(0).disp*1.2)
-            )
-          )
-        1
-       else
-        0
-    }
-  )
-
-  /**
-    *
-    * @param compPattern - Dataframe with exact one row - pattern for search
-    * @param df - history Dataframe where we search comparison
-    * @return df with comparison result column
-    */
-  def ctCompareFormWithPattern(compPattern: DataFrame)(df: DataFrame): DataFrame = {
-    //ctCompareFormWithPattern compPattern.count=1 df.count=943
-    otocLogg.log.info(">>>>>>>     ctCompareFormWithPattern compPattern.count="+compPattern.count()+" df.count="+df.count())
-    df.withColumn("compare_result",udf_comp(compPattern.first())(struct(df.columns.map(df(_)) : _*)) )
-  }
-
-
-
   import org.apache.spark.sql.types._
 
   class ComparePatter() extends UserDefinedAggregateFunction {
@@ -264,6 +182,7 @@ object PattSearch extends App {
    thisRow =>
     println(" -> "+
             thisRow.getAs("ts_begin").toString+" "+
+            thisRow.getAs("c").toString+" "+
             thisRow.getAs("btype").toString+" "+
             thisRow.getAs("disp").toString+" "+
             thisRow.getAs("log_co").toString)
@@ -323,10 +242,27 @@ object PattSearch extends App {
   //joinedHistPattern.printSchema()
 
 
-  joinedHistPattern.show(20)
-
-
+  //joinedHistPattern.show(20)
   //joinedHistPattern.filter($"res_eq_pattern" === 1).show(20)
+
+  joinedHistPattern.createOrReplaceTempView("t_hist_search_res")
+
+
+  /*
+  ,
+                        (select min(fds.ts_begin)
+                           from t_hist_search_res fds
+                          where fds.ts_begin > hsr.ts_begin and fds.c>=(hsr.c+0.0020)
+                         ) as fut_search_20
+  */
+
+  val dfHSR = spark.sql(
+    """ SELECT hsr.*
+                   FROM t_hist_search_res hsr
+                  ORDER BY hsr.ts_begin """)
+
+  dfHSR.show(20)
+
 
   val t2_common = System.currentTimeMillis
   otocLogg.log.info("================== SUMMARY ========================================")
